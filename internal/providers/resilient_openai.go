@@ -346,6 +346,14 @@ func (p *ResilientOpenAIProvider) markBackendCooldown(b *backendState, delay tim
 
 func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName string, fn func(provider *OpenAIProvider) (*ChatResponse, error)) (*ChatResponse, error) {
 	var zero *ChatResponse
+	// Fast-path: single backend -> simple retry/backoff loop without pool logic.
+	p.mu.Lock()
+	single := len(p.backends) == 1 && p.backends[0] != nil && p.backends[0].provider != nil
+	var singleBackend *backendState
+	if single {
+		singleBackend = p.backends[0]
+	}
+	p.mu.Unlock()
 
 	maxAttempts := p.policy.MaxAttempts
 	if maxAttempts <= 0 {
@@ -356,6 +364,64 @@ func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName st
 	var lastErr error
 	attemptsUsed := 0
 
+	if single {
+		// Single backend loop: retry the same provider with backoff.
+		for {
+			if ctx.Err() != nil {
+				return zero, ctx.Err()
+			}
+			if p.policy.MaxElapsed > 0 && time.Since(start) > p.policy.MaxElapsed {
+				return zero, fmt.Errorf("resilient provider %s: max elapsed exceeded", opName)
+			}
+
+			if attemptsUsed >= maxAttempts {
+				if lastErr != nil {
+					return zero, lastErr
+				}
+				return zero, fmt.Errorf("resilient provider %s: exhausted attempts", opName)
+			}
+
+			// We're going to call the backend — consume an attempt.
+			attemptsUsed++
+			attempt := attemptsUsed
+
+			res, err := fn(singleBackend.provider)
+			if err == nil {
+				return res, nil
+			}
+			lastErr = err
+
+			if !isRetryableProviderError(err) {
+				return zero, err
+			}
+
+			delay := computeResilientDelay(err, attempt, p.policy)
+			slog.Warn("resilient provider retry",
+				"backend", singleBackend.cfg.Name,
+				"attempt", attempt,
+				"max_attempts", p.policy.MaxAttempts,
+				"delay", delay,
+				"elapsed", time.Since(start),
+				"error", err.Error(),
+			)
+
+			if p.policy.MaxElapsed > 0 && time.Since(start)+delay > p.policy.MaxElapsed {
+				if lastErr != nil {
+					return zero, lastErr
+				}
+				return zero, fmt.Errorf("resilient provider %s: max elapsed exceeded", opName)
+			}
+
+			select {
+			case <-ctx.Done():
+				return zero, ctx.Err()
+			case <-time.After(delay):
+			}
+			continue
+		}
+	}
+
+	// Pool mode (multiple backends): existing logic preserved
 	for {
 		if ctx.Err() != nil {
 			return zero, ctx.Err()
@@ -439,6 +505,15 @@ func (p *ResilientOpenAIProvider) Chat(ctx context.Context, req ChatRequest) (*C
 
 func (p *ResilientOpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChunk func(StreamChunk)) (*ChatResponse, error) {
 	// Safer streaming: only retry when error happens before any chunk is sent.
+	// Fast-path for single backend: simpler retry/backoff loop without pool logic.
+	p.mu.Lock()
+	single := len(p.backends) == 1 && p.backends[0] != nil && p.backends[0].provider != nil
+	var singleBackend *backendState
+	if single {
+		singleBackend = p.backends[0]
+	}
+	p.mu.Unlock()
+
 	maxAttempts := p.policy.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 1
@@ -447,6 +522,80 @@ func (p *ResilientOpenAIProvider) ChatStream(ctx context.Context, req ChatReques
 	var lastErr error
 	attemptsUsed := 0
 
+	if single {
+		for {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if p.policy.MaxElapsed > 0 && time.Since(start) > p.policy.MaxElapsed {
+				return nil, fmt.Errorf("resilient provider chatstream: max elapsed exceeded")
+			}
+
+			if attemptsUsed >= maxAttempts {
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return nil, fmt.Errorf("resilient provider chatstream: exhausted attempts")
+			}
+
+			started := false
+			wrapped := func(sc StreamChunk) {
+				if !started {
+					started = true
+				}
+				if onChunk != nil {
+					onChunk(sc)
+				}
+			}
+
+			// We'll call provider — consume an attempt only when invoking the backend
+			attemptsUsed++
+			attempt := attemptsUsed
+
+			resp, err := singleBackend.provider.ChatStream(ctx, req, wrapped)
+			if err == nil {
+				return resp, nil
+			}
+
+			lastErr = err
+
+			// If stream already started, don't retry — return error
+			if started {
+				return nil, err
+			}
+
+			if !isRetryableProviderError(err) {
+				return nil, err
+			}
+
+			delay := computeResilientDelay(err, attempt, p.policy)
+
+			slog.Warn("resilient provider retry",
+				"backend", singleBackend.cfg.Name,
+				"attempt", attempt,
+				"max_attempts", p.policy.MaxAttempts,
+				"delay", delay,
+				"elapsed", time.Since(start),
+				"error", err.Error(),
+			)
+
+			if p.policy.MaxElapsed > 0 && time.Since(start)+delay > p.policy.MaxElapsed {
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return nil, fmt.Errorf("resilient provider chatstream: max elapsed exceeded")
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			// continue to next attempt
+		}
+	}
+
+	// Pool mode (multiple backends): existing logic preserved
 	for {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
