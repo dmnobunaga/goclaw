@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -40,6 +41,32 @@ func registerProviders(registry *providers.Registry, cfg *config.Config, modelRe
 		registry.Register(providers.NewOpenAIProvider("openai", cfg.Providers.OpenAI.APIKey, cfg.Providers.OpenAI.APIBase, "gpt-4o").
 			WithRegistry(modelReg))
 		slog.Info("registered provider", "name", "openai")
+	}
+
+	// Optional: register an aggregated resilient OpenAI-compatible provider
+	// when the operator enables it via environment variable. This builds a
+	// small backend list from configured OpenAI-compatible entries and
+	// registers a single resilient provider named "resilient-openai".
+	if os.Getenv("GOCLAW_ENABLE_RESILIENT_OPENAI") == "1" || os.Getenv("GOCLAW_ENABLE_RESILIENT_OPENAI") == "true" {
+		var backends []providers.BackendConfig
+		if cfg.Providers.OpenAI.APIKey != "" {
+			backends = append(backends, providers.BackendConfig{Name: "openai", APIKey: cfg.Providers.OpenAI.APIKey, APIBase: cfg.Providers.OpenAI.APIBase, DefaultModel: "gpt-4o"})
+		}
+		if cfg.Providers.OpenRouter.APIKey != "" {
+			backends = append(backends, providers.BackendConfig{Name: "openrouter", APIKey: cfg.Providers.OpenRouter.APIKey, APIBase: "https://openrouter.ai/api/v1", DefaultModel: "anthropic/claude-sonnet-4-5-20250929"})
+		}
+		if cfg.Providers.Groq.APIKey != "" {
+			backends = append(backends, providers.BackendConfig{Name: "groq", APIKey: cfg.Providers.Groq.APIKey, APIBase: cfg.Providers.Groq.APIBase, DefaultModel: "llama-3.3-70b-versatile"})
+		}
+
+		if len(backends) > 0 {
+			rp := providers.NewResilientOpenAIProvider("resilient-openai", backends, providers.ResilientRetryPolicy{})
+			if modelReg != nil {
+				rp.WithRegistry(modelReg)
+			}
+			registry.Register(rp)
+			slog.Info("registered provider", "name", "resilient-openai")
+		}
 	}
 
 	if cfg.Providers.OpenRouter.APIKey != "" {

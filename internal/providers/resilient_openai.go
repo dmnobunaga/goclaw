@@ -50,6 +50,8 @@ type ResilientOpenAIProvider struct {
 	backends []*backendState
 	policy   ResilientRetryPolicy
 	mu       sync.Mutex
+	// nextIndex is the next backend index to try (round-robin).
+	nextIndex int
 }
 
 // DefaultResilientRetryPolicy returns sensible defaults.
@@ -74,11 +76,46 @@ func DefaultResilientRetryPolicy() ResilientRetryPolicy {
 
 // NewResilientOpenAIProvider constructs a wrapper around multiple OpenAI backends.
 func NewResilientOpenAIProvider(name string, backends []BackendConfig, policy ResilientRetryPolicy) *ResilientOpenAIProvider {
-	if policy.MaxAttempts == 0 {
-		policy = DefaultResilientRetryPolicy()
+	// Merge provided policy into defaults field-by-field. Start with defaults
+	// and override only non-zero (or true for booleans) fields from the caller's policy.
+	merged := DefaultResilientRetryPolicy()
+
+	if policy.MaxAttempts != 0 {
+		merged.MaxAttempts = policy.MaxAttempts
+	}
+	if policy.MaxElapsed != 0 {
+		merged.MaxElapsed = policy.MaxElapsed
 	}
 
-	p := &ResilientOpenAIProvider{name: name, policy: policy}
+	if policy.MinDelay429 != 0 {
+		merged.MinDelay429 = policy.MinDelay429
+	}
+	if policy.MaxDelay429 != 0 {
+		merged.MaxDelay429 = policy.MaxDelay429
+	}
+
+	if policy.MinDelay5xx != 0 {
+		merged.MinDelay5xx = policy.MinDelay5xx
+	}
+	if policy.MaxDelay5xx != 0 {
+		merged.MaxDelay5xx = policy.MaxDelay5xx
+	}
+
+	if policy.MinDelayNetwork != 0 {
+		merged.MinDelayNetwork = policy.MinDelayNetwork
+	}
+	if policy.MaxDelayNetwork != 0 {
+		merged.MaxDelayNetwork = policy.MaxDelayNetwork
+	}
+
+	if policy.Jitter != 0 {
+		merged.Jitter = policy.Jitter
+	}
+	if policy.RespectRetryAfter {
+		merged.RespectRetryAfter = policy.RespectRetryAfter
+	}
+
+	p := &ResilientOpenAIProvider{name: name, policy: merged}
 
 	for _, bc := range backends {
 		prov := NewOpenAIProvider(bc.Name, bc.APIKey, bc.APIBase, bc.DefaultModel)
@@ -157,6 +194,18 @@ func (p *ResilientOpenAIProvider) Capabilities() ProviderCapabilities {
 		return ProviderCapabilities{}
 	}
 	return p.backends[0].provider.Capabilities()
+}
+
+// WithRegistry sets the model registry on all underlying backends.
+func (p *ResilientOpenAIProvider) WithRegistry(r ModelRegistry) *ResilientOpenAIProvider {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, b := range p.backends {
+		if b != nil && b.provider != nil {
+			b.provider.WithRegistry(r)
+		}
+	}
+	return p
 }
 
 // --- error helpers
@@ -249,14 +298,25 @@ func (p *ResilientOpenAIProvider) pickAvailableBackend(now time.Time) (*backendS
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	n := len(p.backends)
+	if n == 0 {
+		return nil, 0
+	}
+
 	var earliest time.Time
 	foundAny := false
 
-	for _, b := range p.backends {
+	// Start scanning from nextIndex for simple round-robin.
+	start := p.nextIndex % n
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		b := p.backends[idx]
 		if b == nil {
 			continue
 		}
 		if b.cooldownUntil.IsZero() || !b.cooldownUntil.After(now) {
+			// advance nextIndex to the following backend for next time
+			p.nextIndex = (idx + 1) % n
 			return b, 0
 		}
 		if !foundAny || b.cooldownUntil.Before(earliest) {
@@ -294,8 +354,9 @@ func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName st
 
 	start := time.Now()
 	var lastErr error
+	attemptsUsed := 0
 
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for {
 		if ctx.Err() != nil {
 			return zero, ctx.Err()
 		}
@@ -303,10 +364,17 @@ func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName st
 			return zero, fmt.Errorf("resilient provider %s: max elapsed exceeded", opName)
 		}
 
+		if attemptsUsed >= maxAttempts {
+			if lastErr != nil {
+				return zero, lastErr
+			}
+			return zero, fmt.Errorf("resilient provider %s: exhausted attempts", opName)
+		}
+
 		now := time.Now()
 		b, wait := p.pickAvailableBackend(now)
 		if b == nil {
-			// Nothing available right now — wait and retry
+			// Nothing available right now — wait and retry (does not consume an attempt)
 			if wait <= 0 {
 				wait = time.Second
 			}
@@ -323,6 +391,10 @@ func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName st
 			}
 			continue
 		}
+
+		// We will attempt a provider call — increment attemptsUsed now
+		attemptsUsed++
+		attempt := attemptsUsed
 
 		res, err := fn(b.provider)
 		if err == nil {
@@ -353,13 +425,8 @@ func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName st
 			"error", err.Error(),
 		)
 
-		// continue to next attempt immediately and let pickAvailableBackend choose another backend
+		// continue to next iteration (waiting or picking another backend)
 	}
-
-	if lastErr != nil {
-		return zero, lastErr
-	}
-	return zero, fmt.Errorf("resilient provider %s: exhausted attempts", opName)
 }
 
 // --- Chat / ChatStream implementations
@@ -378,13 +445,21 @@ func (p *ResilientOpenAIProvider) ChatStream(ctx context.Context, req ChatReques
 	}
 	start := time.Now()
 	var lastErr error
+	attemptsUsed := 0
 
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		if p.policy.MaxElapsed > 0 && time.Since(start) > p.policy.MaxElapsed {
 			return nil, fmt.Errorf("resilient provider chatstream: max elapsed exceeded")
+		}
+
+		if attemptsUsed >= maxAttempts {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, fmt.Errorf("resilient provider chatstream: exhausted attempts")
 		}
 
 		now := time.Now()
@@ -416,6 +491,10 @@ func (p *ResilientOpenAIProvider) ChatStream(ctx context.Context, req ChatReques
 				onChunk(sc)
 			}
 		}
+
+		// We'll call provider — consume an attempt only when invoking the backend
+		attemptsUsed++
+		attempt := attemptsUsed
 
 		resp, err := b.provider.ChatStream(ctx, req, wrapped)
 		if err == nil {
@@ -450,11 +529,6 @@ func (p *ResilientOpenAIProvider) ChatStream(ctx context.Context, req ChatReques
 			"elapsed", time.Since(start),
 			"error", err.Error(),
 		)
-		// continue to next attempt
+		// continue to next iteration
 	}
-
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("resilient provider chatstream: exhausted attempts")
 }
