@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -35,9 +36,9 @@ type ProvidersHandler struct {
 	cliMu           sync.Mutex                       // serializes Claude CLI provider create to prevent duplicates
 	msgBus          *bus.MessageBus
 	sysConfigStore  store.SystemConfigStore
-	tracingStore    store.TracingStore        // optional: for provider-scoped pool activity
-	agents          store.AgentCRUDStore      // optional: for provider pool activity agent lookup
-	modelReg        providers.ModelRegistry   // optional: forward-compat model resolver for Anthropic
+	tracingStore    store.TracingStore      // optional: for provider-scoped pool activity
+	agents          store.AgentCRUDStore    // optional: for provider pool activity agent lookup
+	modelReg        providers.ModelRegistry // optional: forward-compat model resolver for Anthropic
 }
 
 // NewProvidersHandler creates a handler for provider management endpoints.
@@ -239,6 +240,111 @@ func (h *ProvidersHandler) registerInMemory(p *store.LLMProviderData) {
 			base = store.NovitaDefaultAPIBase
 		}
 		h.providerReg.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, store.NovitaDefaultModel))
+
+	case store.ProviderResilientOpenAI:
+		// Support resilient provider stored in DB. Settings JSON may contain
+		// detailed backends + policy; otherwise fall back to single backend
+		// using api_base + api_key from the DB record.
+		var rcfg config.ResilientOpenAIConfig
+		if len(p.Settings) > 0 {
+			if err := json.Unmarshal(p.Settings, &rcfg); err != nil {
+				slog.Warn("resilient provider: failed to parse settings, falling back to api_base/api_key", "provider", p.Name, "error", err)
+			}
+		}
+
+		var backends []providers.BackendConfig
+		if len(rcfg.Backends) > 0 {
+			for _, b := range rcfg.Backends {
+				bc := providers.BackendConfig{
+					Name:         b.Name,
+					APIKey:       b.APIKey,
+					APIBase:      b.APIBase,
+					DefaultModel: b.DefaultModel,
+				}
+				if bc.APIBase == "" {
+					base := p.APIBase
+					if base == "" {
+						base = h.resolveAPIBase(p)
+					}
+					bc.APIBase = base
+				}
+				backends = append(backends, bc)
+			}
+		} else {
+			base := p.APIBase
+			if base == "" {
+				base = h.resolveAPIBase(p)
+			}
+			backends = append(backends, providers.BackendConfig{Name: p.Name, APIKey: p.APIKey, APIBase: base})
+		}
+
+		// Build retry policy from settings when present
+		var policy providers.ResilientRetryPolicy
+		if rcfg.MaxAttempts != 0 {
+			policy.MaxAttempts = rcfg.MaxAttempts
+		}
+		if rcfg.MaxElapsed != "" {
+			if d, err := time.ParseDuration(rcfg.MaxElapsed); err == nil {
+				policy.MaxElapsed = d
+			} else {
+				slog.Warn("resilient provider: invalid max_elapsed, ignoring", "provider", p.Name, "value", rcfg.MaxElapsed, "error", err)
+			}
+		}
+		if rcfg.MinDelay429 != "" {
+			if d, err := time.ParseDuration(rcfg.MinDelay429); err == nil {
+				policy.MinDelay429 = d
+			} else {
+				slog.Warn("resilient provider: invalid min_delay_429, ignoring", "provider", p.Name, "value", rcfg.MinDelay429, "error", err)
+			}
+		}
+		if rcfg.MaxDelay429 != "" {
+			if d, err := time.ParseDuration(rcfg.MaxDelay429); err == nil {
+				policy.MaxDelay429 = d
+			} else {
+				slog.Warn("resilient provider: invalid max_delay_429, ignoring", "provider", p.Name, "value", rcfg.MaxDelay429, "error", err)
+			}
+		}
+		if rcfg.MinDelay5xx != "" {
+			if d, err := time.ParseDuration(rcfg.MinDelay5xx); err == nil {
+				policy.MinDelay5xx = d
+			} else {
+				slog.Warn("resilient provider: invalid min_delay_5xx, ignoring", "provider", p.Name, "value", rcfg.MinDelay5xx, "error", err)
+			}
+		}
+		if rcfg.MaxDelay5xx != "" {
+			if d, err := time.ParseDuration(rcfg.MaxDelay5xx); err == nil {
+				policy.MaxDelay5xx = d
+			} else {
+				slog.Warn("resilient provider: invalid max_delay_5xx, ignoring", "provider", p.Name, "value", rcfg.MaxDelay5xx, "error", err)
+			}
+		}
+		if rcfg.MinDelayNetwork != "" {
+			if d, err := time.ParseDuration(rcfg.MinDelayNetwork); err == nil {
+				policy.MinDelayNetwork = d
+			} else {
+				slog.Warn("resilient provider: invalid min_delay_network, ignoring", "provider", p.Name, "value", rcfg.MinDelayNetwork, "error", err)
+			}
+		}
+		if rcfg.MaxDelayNetwork != "" {
+			if d, err := time.ParseDuration(rcfg.MaxDelayNetwork); err == nil {
+				policy.MaxDelayNetwork = d
+			} else {
+				slog.Warn("resilient provider: invalid max_delay_network, ignoring", "provider", p.Name, "value", rcfg.MaxDelayNetwork, "error", err)
+			}
+		}
+		if rcfg.Jitter != 0 {
+			policy.Jitter = rcfg.Jitter
+		}
+		if rcfg.RespectRetryAfter != nil {
+			policy.RespectRetryAfter = *rcfg.RespectRetryAfter
+		}
+
+		rp := providers.NewResilientOpenAIProvider(p.Name, backends, policy)
+		if h.modelReg != nil {
+			rp.WithRegistry(h.modelReg)
+		}
+		h.providerReg.RegisterForTenant(p.TenantID, rp)
+		return
 	default:
 		prov := providers.NewOpenAIProvider(p.Name, p.APIKey, apiBase, "")
 		if p.ProviderType == store.ProviderMiniMax {
@@ -267,9 +373,10 @@ func normalizeOllamaAPIBase(p *store.LLMProviderData) {
 // localProviderTypes are provider types that legitimately run on localhost
 // (e.g. Ollama, Claude CLI). SSRF checks are skipped for these.
 var localProviderTypes = map[string]bool{
-	store.ProviderOllama:    true,
-	store.ProviderClaudeCLI: true,
-	store.ProviderACP:       true,
+	store.ProviderOllama:          true,
+	store.ProviderClaudeCLI:       true,
+	store.ProviderACP:             true,
+	store.ProviderResilientOpenAI: true,
 }
 
 // validateProviderURL rejects provider base URLs pointing to internal/private networks.

@@ -29,4 +29,6 @@ export const PROVIDER_TYPES: ProviderTypeInfo[] = [
   { value: 'ollama_cloud', label: 'Ollama Cloud', apiBase: 'https://ollama.com/v1', needsKey: true },
   { value: 'claude_cli', label: 'Claude CLI (Local)', apiBase: '', needsKey: false },
   { value: 'acp', label: 'ACP Agent (Subprocess)', apiBase: '', needsKey: false },
+  { value: "resilient_openai", label: "Resilient OpenAI (Many Retry)", apiBase: "https://openrouter.ai/api/v1", needsKey: true },
+
 ]
