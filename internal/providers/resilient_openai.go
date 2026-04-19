@@ -371,6 +371,9 @@ func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName st
 				return zero, ctx.Err()
 			}
 			if p.policy.MaxElapsed > 0 && time.Since(start) > p.policy.MaxElapsed {
+				if lastErr != nil {
+					return zero, fmt.Errorf("resilient provider %s: max elapsed exceeded after last error: %w", opName, lastErr)
+				}
 				return zero, fmt.Errorf("resilient provider %s: max elapsed exceeded", opName)
 			}
 
@@ -407,7 +410,7 @@ func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName st
 
 			if p.policy.MaxElapsed > 0 && time.Since(start)+delay > p.policy.MaxElapsed {
 				if lastErr != nil {
-					return zero, lastErr
+					return zero, fmt.Errorf("resilient provider %s: max elapsed exceeded after last error: %w", opName, lastErr)
 				}
 				return zero, fmt.Errorf("resilient provider %s: max elapsed exceeded", opName)
 			}
@@ -427,6 +430,9 @@ func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName st
 			return zero, ctx.Err()
 		}
 		if p.policy.MaxElapsed > 0 && time.Since(start) > p.policy.MaxElapsed {
+			if lastErr != nil {
+				return zero, fmt.Errorf("resilient provider %s: max elapsed exceeded after last error: %w", opName, lastErr)
+			}
 			return zero, fmt.Errorf("resilient provider %s: max elapsed exceeded", opName)
 		}
 
@@ -446,7 +452,7 @@ func (p *ResilientOpenAIProvider) doWithRetryChat(ctx context.Context, opName st
 			}
 			if p.policy.MaxElapsed > 0 && time.Since(start)+wait > p.policy.MaxElapsed {
 				if lastErr != nil {
-					return zero, lastErr
+					return zero, fmt.Errorf("resilient provider %s: no backends available and max elapsed exceeded after last error: %w", opName, lastErr)
 				}
 				return zero, fmt.Errorf("resilient provider %s: no backends available and max elapsed exceeded", opName)
 			}
@@ -528,6 +534,9 @@ func (p *ResilientOpenAIProvider) ChatStream(ctx context.Context, req ChatReques
 				return nil, ctx.Err()
 			}
 			if p.policy.MaxElapsed > 0 && time.Since(start) > p.policy.MaxElapsed {
+				if lastErr != nil {
+					return nil, fmt.Errorf("resilient provider chatstream: max elapsed exceeded after last error: %w", lastErr)
+				}
 				return nil, fmt.Errorf("resilient provider chatstream: max elapsed exceeded")
 			}
 
@@ -581,7 +590,7 @@ func (p *ResilientOpenAIProvider) ChatStream(ctx context.Context, req ChatReques
 
 			if p.policy.MaxElapsed > 0 && time.Since(start)+delay > p.policy.MaxElapsed {
 				if lastErr != nil {
-					return nil, lastErr
+					return nil, fmt.Errorf("resilient provider chatstream: max elapsed exceeded after last error: %w", lastErr)
 				}
 				return nil, fmt.Errorf("resilient provider chatstream: max elapsed exceeded")
 			}
@@ -601,6 +610,9 @@ func (p *ResilientOpenAIProvider) ChatStream(ctx context.Context, req ChatReques
 			return nil, ctx.Err()
 		}
 		if p.policy.MaxElapsed > 0 && time.Since(start) > p.policy.MaxElapsed {
+			if lastErr != nil {
+				return nil, fmt.Errorf("resilient provider chatstream: max elapsed exceeded after last error: %w", lastErr)
+			}
 			return nil, fmt.Errorf("resilient provider chatstream: max elapsed exceeded")
 		}
 
@@ -619,7 +631,7 @@ func (p *ResilientOpenAIProvider) ChatStream(ctx context.Context, req ChatReques
 			}
 			if p.policy.MaxElapsed > 0 && time.Since(start)+wait > p.policy.MaxElapsed {
 				if lastErr != nil {
-					return nil, lastErr
+					return nil, fmt.Errorf("resilient provider chatstream: no backends available and max elapsed exceeded after last error: %w", lastErr)
 				}
 				return nil, fmt.Errorf("resilient provider chatstream: no backends available and max elapsed exceeded")
 			}
