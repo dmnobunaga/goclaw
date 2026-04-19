@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -45,41 +44,113 @@ func registerProviders(registry *providers.Registry, cfg *config.Config, modelRe
 		slog.Info("registered provider", "name", "openai")
 	}
 
-	// Optional: register a resilient provider scoped to custom local endpoints.
-	// Operator may set GOCLAW_RESILIENT_OPENAI_ENDPOINTS to a comma-separated
-	// list of API base URLs and (optionally) GOCLAW_RESILIENT_OPENAI_APIKEYS to
-	// a parallel, comma-separated list of API keys. Only endpoints that look
-	// local (localhost/127.0.0.1/0.0.0.0/::1) are considered for the resilient
-	// local provider — we intentionally avoid aggregating public OpenAI-like
-	// providers here.
-	if eps := os.Getenv("GOCLAW_RESILIENT_OPENAI_ENDPOINTS"); eps != "" {
-		endpoints := strings.Split(eps, ",")
-		keys := strings.Split(os.Getenv("GOCLAW_RESILIENT_OPENAI_APIKEYS"), ",")
-		var backends []providers.BackendConfig
-		for i := range endpoints {
-			e := strings.TrimSpace(endpoints[i])
-			if e == "" {
-				continue
-			}
-			low := strings.ToLower(e)
-			if !(strings.Contains(low, "localhost") || strings.Contains(low, "127.0.0.1") || strings.Contains(low, "0.0.0.0") || strings.Contains(low, "[::1]")) {
-				// skip non-local endpoints
-				continue
-			}
-			key := ""
-			if i < len(keys) {
-				key = strings.TrimSpace(keys[i])
-			}
-			name := fmt.Sprintf("resilient-local-%d", i+1)
-			backends = append(backends, providers.BackendConfig{Name: name, APIKey: key, APIBase: strings.TrimRight(e, "/"), DefaultModel: ""})
+	// Optional: register a resilient provider driven by config at
+	// cfg.Providers.ResilientOpenAI. This config is intended for
+	// custom/local OpenAI-compatible endpoints (backends); only local
+	// endpoints are accepted by default unless AllowRemote is set.
+	if len(cfg.Providers.ResilientOpenAI.Backends) > 0 {
+		rconf := cfg.Providers.ResilientOpenAI
+		enabled := true
+		if rconf.Enabled != nil {
+			enabled = *rconf.Enabled
 		}
-		if len(backends) > 0 {
-			rp := providers.NewResilientOpenAIProvider("resilient-local", backends, providers.ResilientRetryPolicy{})
-			if modelReg != nil {
-				rp.WithRegistry(modelReg)
+		if enabled {
+			var backends []providers.BackendConfig
+			allowRemote := false
+			if rconf.AllowRemote != nil {
+				allowRemote = *rconf.AllowRemote
 			}
-			registry.Register(rp)
-			slog.Info("registered provider", "name", "resilient-local")
+			for i, be := range rconf.Backends {
+				api := strings.TrimSpace(be.APIBase)
+				if api == "" {
+					slog.Warn("resilient-local: backend missing api_base", "index", i)
+					continue
+				}
+				api = strings.TrimRight(api, "/")
+				low := strings.ToLower(api)
+				if !allowRemote && !(strings.Contains(low, "localhost") || strings.Contains(low, "127.0.0.1") || strings.Contains(low, "0.0.0.0") || strings.Contains(low, "[::1]")) {
+					slog.Warn("resilient-local: skipping non-local endpoint", "api_base", api)
+					continue
+				}
+				name := be.Name
+				if name == "" {
+					name = fmt.Sprintf("resilient-backend-%d", i+1)
+				}
+				backends = append(backends, providers.BackendConfig{Name: name, APIKey: be.APIKey, APIBase: api, DefaultModel: be.DefaultModel})
+			}
+
+			if len(backends) > 0 {
+				policy := providers.DefaultResilientRetryPolicy()
+				if rconf.MaxAttempts > 0 {
+					policy.MaxAttempts = rconf.MaxAttempts
+				}
+				if rconf.MaxElapsed != "" {
+					if d, err := time.ParseDuration(rconf.MaxElapsed); err == nil && d > 0 {
+						policy.MaxElapsed = d
+					} else {
+						slog.Warn("resilient-local: invalid max_elapsed", "value", rconf.MaxElapsed)
+					}
+				}
+				if rconf.MinDelay429 != "" {
+					if d, err := time.ParseDuration(rconf.MinDelay429); err == nil && d > 0 {
+						policy.MinDelay429 = d
+					} else {
+						slog.Warn("resilient-local: invalid min_delay_429", "value", rconf.MinDelay429)
+					}
+				}
+				if rconf.MaxDelay429 != "" {
+					if d, err := time.ParseDuration(rconf.MaxDelay429); err == nil && d > 0 {
+						policy.MaxDelay429 = d
+					} else {
+						slog.Warn("resilient-local: invalid max_delay_429", "value", rconf.MaxDelay429)
+					}
+				}
+				if rconf.MinDelay5xx != "" {
+					if d, err := time.ParseDuration(rconf.MinDelay5xx); err == nil && d > 0 {
+						policy.MinDelay5xx = d
+					} else {
+						slog.Warn("resilient-local: invalid min_delay_5xx", "value", rconf.MinDelay5xx)
+					}
+				}
+				if rconf.MaxDelay5xx != "" {
+					if d, err := time.ParseDuration(rconf.MaxDelay5xx); err == nil && d > 0 {
+						policy.MaxDelay5xx = d
+					} else {
+						slog.Warn("resilient-local: invalid max_delay_5xx", "value", rconf.MaxDelay5xx)
+					}
+				}
+				if rconf.MinDelayNetwork != "" {
+					if d, err := time.ParseDuration(rconf.MinDelayNetwork); err == nil && d > 0 {
+						policy.MinDelayNetwork = d
+					} else {
+						slog.Warn("resilient-local: invalid min_delay_network", "value", rconf.MinDelayNetwork)
+					}
+				}
+				if rconf.MaxDelayNetwork != "" {
+					if d, err := time.ParseDuration(rconf.MaxDelayNetwork); err == nil && d > 0 {
+						policy.MaxDelayNetwork = d
+					} else {
+						slog.Warn("resilient-local: invalid max_delay_network", "value", rconf.MaxDelayNetwork)
+					}
+				}
+				if rconf.Jitter > 0 {
+					policy.Jitter = rconf.Jitter
+				}
+				if rconf.RespectRetryAfter != nil {
+					policy.RespectRetryAfter = *rconf.RespectRetryAfter
+				}
+
+				providerName := rconf.Name
+				if providerName == "" {
+					providerName = "resilient-local"
+				}
+				rp := providers.NewResilientOpenAIProvider(providerName, backends, policy)
+				if modelReg != nil {
+					rp.WithRegistry(modelReg)
+				}
+				registry.Register(rp)
+				slog.Info("registered provider", "name", providerName)
+			}
 		}
 	}
 

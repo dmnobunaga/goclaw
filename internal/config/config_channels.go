@@ -218,6 +218,7 @@ type ProvidersConfig struct {
 	Novita         ProviderConfig  `json:"novita"`          // Novita AI (OpenAI-compatible endpoint)
 	BytePlus       ProviderConfig  `json:"byteplus"`        // BytePlus ModelArk (Seed 2.0)
 	BytePlusCoding ProviderConfig  `json:"byteplus_coding"` // BytePlus ModelArk Coding Plan
+	ResilientOpenAI ResilientOpenAIConfig `json:"resilient_openai"` // resilient OpenAI-compatible wrapper for local/custom endpoints
 }
 
 // OllamaConfig configures a local (or self-hosted) Ollama instance.
@@ -248,6 +249,37 @@ type ACPConfig struct {
 type ProviderConfig struct {
 	APIKey  string `json:"api_key"`
 	APIBase string `json:"api_base,omitempty"`
+}
+
+// ResilientBackendConfig describes a single backend entry for the resilient provider.
+type ResilientBackendConfig struct {
+	Name         string `json:"name,omitempty"`
+	APIKey       string `json:"api_key,omitempty"`
+	APIBase      string `json:"api_base,omitempty"`
+	DefaultModel string `json:"default_model,omitempty"`
+}
+
+// ResilientOpenAIConfig configures the resilient OpenAI-compatible wrapper.
+// Designed for local/custom endpoints; UI will expose fields for backends and
+// retry/backoff tuning. Durations are expressed as Go duration strings.
+type ResilientOpenAIConfig struct {
+	Name        string                   `json:"name,omitempty"`         // provider name (default: "resilient-local")
+	Enabled     *bool                    `json:"enabled,omitempty"`      // nil = enabled
+	AllowRemote *bool                    `json:"allow_remote,omitempty"` // allow non-local endpoints (default false)
+	Backends    []ResilientBackendConfig `json:"backends,omitempty"`     // list of backend endpoints
+
+	MaxAttempts int    `json:"max_attempts,omitempty"` // overrides default
+	MaxElapsed  string `json:"max_elapsed,omitempty"`  // Go duration string, e.g. "30m"
+
+	MinDelay429     string `json:"min_delay_429,omitempty"`
+	MaxDelay429     string `json:"max_delay_429,omitempty"`
+	MinDelay5xx     string `json:"min_delay_5xx,omitempty"`
+	MaxDelay5xx     string `json:"max_delay_5xx,omitempty"`
+	MinDelayNetwork string `json:"min_delay_network,omitempty"`
+	MaxDelayNetwork string `json:"max_delay_network,omitempty"`
+
+	Jitter            float64 `json:"jitter,omitempty"`
+	RespectRetryAfter *bool   `json:"respect_retry_after,omitempty"`
 }
 
 // APIBaseForType returns the config-level api_base for a given provider type.
